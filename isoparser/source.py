@@ -1,10 +1,10 @@
 import datetime
 import struct
-import urllib
 
-import path_table
-import record
-import volume_descriptors
+from six.moves.urllib import request
+from six.moves import range
+
+from . import path_table, record, volume_descriptors, susp
 
 
 SECTOR_LENGTH = 2048
@@ -21,9 +21,17 @@ class Source(object):
         self.cursor = None
         self.cache_content = cache_content
         self.min_fetch = min_fetch
+        self.susp_starting_index = None
+        self.susp_extensions = []
+        self.rockridge = False
 
     def __len__(self):
         return len(self._buff) - self.cursor
+
+    def rewind_raw(self, l):
+        if self.cursor < l:
+            raise SourceError("Rewind buffer under-run")
+        self.cursor -= l
 
     def unpack_raw(self, l):
         if l > len(self):
@@ -46,7 +54,7 @@ class Source(object):
         return a
 
     def unpack_string(self, l):
-        return self.unpack_raw(l).rstrip(' ')
+        return self.unpack_raw(l).rstrip(b' ')
 
     def unpack(self, st):
         if st[0] not in '<>':
@@ -57,14 +65,18 @@ class Source(object):
         else:
             return d
 
+    def rewind(self, st):
+        self.rewind_raw(struct.calcsize(st))
+
     def unpack_vd_datetime(self):
         return self.unpack_raw(17)  # TODO
 
     def unpack_dir_datetime(self):
         epoch = datetime.datetime(1970, 1, 1)
         date = self.unpack_raw(7)
-        t = [struct.unpack('<B', i)[0] for i in date[:-1]]
-        t.append(struct.unpack('<b', date[-1])[0])
+        t = [struct.unpack('<B', bytes([i]) if isinstance(i, int) else i)[0]
+             for i in date]
+        t.append(struct.unpack('<b', date[-1:])[0])
         t[0] += 1900
         t_offset = t.pop(-1) * 15 * 60.    # Offset from GMT in 15min intervals, converted to secs
         t_timestamp = (datetime.datetime(*t) - epoch).total_seconds() - t_offset
@@ -77,11 +89,11 @@ class Source(object):
         identifier = self.unpack_string(5)
         version = self.unpack('B')
 
-        if identifier != "CD001":
+        if identifier != b"CD001":
             raise SourceError("Wrong volume descriptor identifier")
         if version != 1:
             raise SourceError("Wrong volume descriptor version")
-        
+
         if ty == 0:
             vd = volume_descriptors.BootVD(self)
         elif ty == 1:
@@ -100,14 +112,44 @@ class Source(object):
         return path_table.PathTable(self)
 
     def unpack_record(self):
+        start_cursor = self.cursor
         length = self.unpack('B')
         if length == 0:
+            self.rewind('B')
             return None
-        return record.Record(self, length-1)
+        new_record = record.Record(self, length-1, self.susp_starting_index)
+        assert self.cursor == start_cursor + length
+        return new_record
+
+    def unpack_susp(self, maxlen, possible_extension=0):
+        if maxlen < 4:
+            return None
+        start_cursor = self.cursor
+        signature = self.unpack_raw(2).decode()
+        length = self.unpack('B')
+        version = self.unpack('B')
+        if maxlen < length:
+            self.rewind_raw(4)
+            return None
+        if possible_extension < len(self.susp_extensions):
+            extension = self.susp_extensions[possible_extension]
+            ext_id_ver = (extension.ext_id, extension.ext_ver)
+        else:
+            ext_id_ver = None
+        try:
+            new_susp = susp.SUSP_Entry.unpack(self, ext_id_ver, (signature, version), length - 4)
+        except susp.SUSPError:
+            self.cursor = start_cursor
+            # Fall into the next if statement
+        if self.cursor != start_cursor + length:
+            self.cursor = start_cursor + 4
+            new_susp = susp.UnknownEntry(self, ext_id_ver, (signature, version), length - 4)
+        assert self.cursor == start_cursor + length
+        return new_susp
 
     def seek(self, start_sector, length=SECTOR_LENGTH, is_content=False):
         self.cursor = 0
-        self._buff = ""
+        self._buff = b""
         do_caching = (not is_content or self.cache_content)
         n_sectors = 1 + (length - 1) // SECTOR_LENGTH
         fetch_sectors = max(self.min_fetch, n_sectors) if do_caching else n_sectors
@@ -117,10 +159,10 @@ class Source(object):
             data = self._fetch(need_start, need_count)
             self._buff += data
             if do_caching:
-                for sector_idx in xrange(need_count):
+                for sector_idx in range(need_count):
                     self._sectors[need_start + sector_idx] = data[sector_idx*SECTOR_LENGTH:(sector_idx+1)*SECTOR_LENGTH]
 
-        for sector in xrange(start_sector, start_sector + fetch_sectors):
+        for sector in range(start_sector, start_sector + fetch_sectors):
             if sector in self._sectors:
                 if need_start is not None:
                     fetch_needed(sector - need_start)
@@ -137,8 +179,46 @@ class Source(object):
 
         self._buff = self._buff[:length]
 
+    def save_cursor(self):
+        return (self._buff, self.cursor)
+
+    def restore_cursor(self, cursor_def):
+        self._buff, self.cursor = cursor_def
+
     def _fetch(self, sector, count=1):
         raise NotImplementedError
+
+    def get_stream(self, sector, length):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class FileStream(Source):
+    def __init__(self, file, offset, length):
+        super(FileStream, self).__init__()
+        self._file = file
+        self._offset = offset
+        self._length = length
+        self.cur_offset = 0
+
+    def read(self, *args):
+        size = args[0] if args else -1
+        self._file.seek(self._offset + self.cur_offset)
+        if size < 0 or size > self._length - self.cur_offset:
+            size = self._length - self.cur_offset
+        data = self._file.read(size)
+        if data:
+            self.cur_offset += len(data)
+        return data
+
+    def _fetch(self, sector, count=1):
+        self._file.seek(sector*SECTOR_LENGTH)
+        return self._file.read(SECTOR_LENGTH*count)
+
+    def close(self):
+        pass
 
 
 class FileSource(Source):
@@ -150,6 +230,12 @@ class FileSource(Source):
         self._file.seek(sector*SECTOR_LENGTH)
         return self._file.read(SECTOR_LENGTH*count)
 
+    def get_stream(self, sector, length):
+        return FileStream(self._file, sector*SECTOR_LENGTH, length)
+
+    def close(self):
+        self._file.close()
+
 
 class HTTPSource(Source):
     def __init__(self, url, **kwargs):
@@ -157,9 +243,12 @@ class HTTPSource(Source):
         self._url = url
 
     def _fetch(self, sector, count=1):
-        opener = urllib.FancyURLopener()
+        return self.get_stream(sector, count*SECTOR_LENGTH).read()
+
+    def get_stream(self, sector, length):
+        opener = request.FancyURLopener()
         opener.http_error_206 = lambda *a, **k: None
         opener.addheader("Range", "bytes=%d-%d" % (
             SECTOR_LENGTH * sector,
-            SECTOR_LENGTH * (sector + count) - 1))
-        return opener.open(self._url).read()
+            SECTOR_LENGTH * sector + length - 1))
+        return opener.open(self._url)
